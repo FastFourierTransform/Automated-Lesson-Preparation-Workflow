@@ -298,9 +298,13 @@ class ReviewPanel(QWidget):
             for index, page in enumerate(pages):
                 item = QListWidgetItem(self._page_icon(page), self._page_item_text(page, index))
                 item.setData(Qt.ItemDataRole.UserRole, page.id)
+                source_note = ""
+                if self.project and len(self.project.video_sources()) > 1:
+                    source_note = "\n" + self.project.source_video_label(page.video_index)
                 item.setToolTip(
                     f"第 {index + 1} 页 · {format_timecode(page.selected_time, milliseconds=True)}"
                     f"\n置信度 {page.confidence * 100:.0f}%"
+                    + source_note
                     + (f"\n{page.label_flags}" if page.flags else "")
                 )
                 item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -475,6 +479,8 @@ class ReviewPanel(QWidget):
                 else "截图文件缺失或无法读取"
             )
             title = f"第 {index + 1} 页 · {format_timecode(page.selected_time, milliseconds=True)}"
+            if len(self.project.video_sources()) > 1:
+                title += f"  ·  {self.project.source_video_label(page.video_index)}"
             if page.manually_modified:
                 title += "  ·  已人工修改"
             self.page_title.setText(title)
@@ -620,6 +626,8 @@ class ReviewPanel(QWidget):
             if page
             else "大图预览"
         )
+        if page is not None and self.project is not None and len(self.project.video_sources()) > 1:
+            title += f" · {self.project.source_video_label(page.video_index)}"
         ImagePreviewDialog(self._current_image, title, self).exec()
 
     def _move_current(self, delta: int) -> None:

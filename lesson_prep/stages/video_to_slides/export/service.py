@@ -327,6 +327,12 @@ def _write_manifest(
                 "kept": bool(page.kept),
                 "selected_time_sec": round(float(page.selected_time), 3),
                 "selected_timecode": format_timecode(page.selected_time, milliseconds=True),
+                "video_index": int(page.video_index),
+                "source_video": (
+                    project.video_sources()[page.video_index].path
+                    if 0 <= page.video_index < len(project.video_sources())
+                    else None
+                ),
                 "interval_start_sec": round(float(page.interval_start), 3),
                 "interval_end_sec": round(float(page.interval_end), 3),
                 "confidence": round(float(page.confidence), 4),
@@ -374,6 +380,8 @@ def _write_manifest(
         "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_video": project.video_info.path,
         "source_video_info": project.video_info.to_dict(),
+        "source_videos": [info.to_dict() for info in project.video_sources()],
+        "video_count": len(project.video_sources()),
         "project_file": str(project.project_path) if project.project_path else None,
         "project_name": project.name,
         "content_range": {

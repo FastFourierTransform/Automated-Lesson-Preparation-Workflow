@@ -15,6 +15,27 @@ ARTIFACTS = ROOT / "test_artifacts"
 DEMO_PATH = ARTIFACTS / "demo_lecture.mp4"
 
 
+@pytest.fixture(autouse=True)
+def isolated_qsettings(tmp_path):
+    """Keep persisted UI preferences from leaking between tests/machines."""
+    from PySide6.QtCore import QSettings
+
+    from lesson_prep.version import APP_ID
+
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
+    QSettings.setPath(
+        QSettings.Format.IniFormat,
+        QSettings.Scope.UserScope,
+        str(tmp_path / "qt_settings"),
+    )
+    store = QSettings(APP_ID, APP_ID)
+    store.clear()
+    store.sync()
+    yield
+    store.clear()
+    store.sync()
+
+
 @pytest.fixture(scope="session")
 def demo_video() -> Path:
     from scripts.generate_demo_video import create_demo_video

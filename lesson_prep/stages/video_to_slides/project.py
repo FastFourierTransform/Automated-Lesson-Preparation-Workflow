@@ -66,7 +66,10 @@ def _to_dict(project: SlidesProject) -> dict[str, Any]:
         "assets_folder": assets_name,
         "project": {
             "name": project.name,
+            # ``video_info`` is kept for older readers; ``videos`` is the full
+            # ordered multi-video source list.
             "video_info": project.video_info.to_dict(),
+            "videos": [info.to_dict() for info in project.video_sources()],
             "content_start": round(float(project.content_start), 3),
             "content_end": round(float(project.content_end), 3),
             "ppt_region": project.ppt_region.to_dict(),
@@ -115,6 +118,18 @@ def _from_dict(data: dict[str, Any], project_path: Path, assets_root: Path) -> S
     video_info = VideoInfo.from_dict(body.get("video_info"))
     if not video_info.path:
         video_info.path = str(data.get("video_path") or "")
+    raw_videos = body.get("videos")
+    if isinstance(raw_videos, list) and raw_videos:
+        videos = [
+            VideoInfo.from_dict(item)
+            for item in raw_videos
+            if isinstance(item, dict) and (item.get("path") or item.get("duration_sec"))
+        ]
+    else:
+        videos = [video_info] if (video_info.path or video_info.duration_sec > 0) else []
+    if videos:
+        # The first source is the compatibility "video_info" for older code.
+        video_info = videos[0]
     settings = AnalysisSettings.from_dict(body.get("settings"))
     raw_camera_regions = body.get("camera_regions")
     if raw_camera_regions is not None:
@@ -140,10 +155,14 @@ def _from_dict(data: dict[str, Any], project_path: Path, assets_root: Path) -> S
     history = [ManualChange.from_dict(item) for item in (body.get("manual_history") or [])]
     removed = [RemovedPageRecord.from_dict(item) for item in (body.get("removed_pages") or [])]
     trash = [TrashEntry.from_dict(item) for item in (body.get("trash") or [])]
-    content_end = float(body.get("content_end") or video_info.duration_sec or 0.0)
+    fallback_end = sum(
+        float(info.duration_sec or 0.0) for info in videos
+    ) or float(video_info.duration_sec or 0.0)
+    content_end = float(body.get("content_end") or fallback_end or 0.0)
     project = SlidesProject(
         name=str(body.get("name") or project_path.stem),
         video_info=video_info,
+        videos=videos,
         content_start=float(body.get("content_start") or 0.0),
         content_end=content_end,
         ppt_region=Rect.from_dict(body.get("ppt_region"), Rect.full_frame()) or Rect.full_frame(),

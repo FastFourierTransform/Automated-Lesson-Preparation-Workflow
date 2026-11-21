@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -53,6 +55,7 @@ from ..project import (
 )
 from .config import AppPreferences
 from .export_dialog import ExportDialog
+from .preview_dialog import LargePreviewDialog
 from .review_panel import ReviewPanel
 from .settings_dialog import AnalysisSettingsDialog
 from .workers import AnalysisWorker, ExportWorker
@@ -84,6 +87,8 @@ class MainWindow(QMainWindow):
         self.export_worker: ExportWorker | None = None
         self._busy_kind: str | None = None
         self._selecting_region: str | None = None
+        self._selection_canvas = None
+        self.preview_dialog: LargePreviewDialog | None = None
         self._loading_project = False
         self._scrubbing = False
         self._resume_after_scrub = False
@@ -201,6 +206,11 @@ class MainWindow(QMainWindow):
         self.selection_hint_label = QLabel("")
         self.selection_hint_label.setObjectName("mutedLabel")
         preview_header.addWidget(self.selection_hint_label)
+        self.open_preview_button = QPushButton("放大预览…")
+        self.open_preview_button.setToolTip(
+            "打开更大的预览窗口，并可在其中框选 PPT 区域和摄像头区域（窗口内 F11 全屏）。"
+        )
+        preview_header.addWidget(self.open_preview_button)
         preview_layout.addLayout(preview_header)
 
         self.preview = PreviewCanvas()
@@ -314,6 +324,34 @@ class MainWindow(QMainWindow):
         form.addRow("文件", self.info_file)
         form.addRow("规格", self.info_spec)
         layout.addLayout(form)
+
+        self.video_list = QListWidget()
+        self.video_list.setObjectName("videoSourceList")
+        self.video_list.setFixedHeight(92)
+        self.video_list.setToolTip("按导入顺序连续播放和分析。双击某一项可定位到该视频起点。")
+        self.video_list.itemDoubleClicked.connect(self._seek_to_video_item)
+        layout.addWidget(self.video_list)
+        video_buttons = QHBoxLayout()
+        video_buttons.setSpacing(4)
+        self.add_video_button = QPushButton("添加视频…")
+        self.add_video_button.setToolTip("把更多视频追加到连续时间轴末尾。")
+        self.remove_video_button = QPushButton("移除")
+        self.remove_video_button.setToolTip("从时间轴移除选中的视频。")
+        self.up_video_button = QPushButton("上移")
+        self.down_video_button = QPushButton("下移")
+        for button in (
+            self.add_video_button,
+            self.remove_video_button,
+            self.up_video_button,
+            self.down_video_button,
+        ):
+            video_buttons.addWidget(button)
+        layout.addLayout(video_buttons)
+        self.add_video_button.clicked.connect(self.append_videos)
+        self.remove_video_button.clicked.connect(self._remove_selected_video)
+        self.up_video_button.clicked.connect(lambda: self._move_selected_video(-1))
+        self.down_video_button.clicked.connect(lambda: self._move_selected_video(1))
+
         self.ffmpeg_label = QLabel("")
         self.ffmpeg_label.setWordWrap(True)
         self.ffmpeg_label.setObjectName("mutedLabel")
@@ -520,6 +558,17 @@ class MainWindow(QMainWindow):
             primary_kind="ppt",
             primary_label="PPT 区域",
         )
+        if self.preview_dialog is not None:
+            self.preview_dialog.set_project(self.project, self._regions_editable())
+
+    def _remember_regions(self) -> None:
+        """Persist the current region selection for the next import."""
+        if self.project is None:
+            return
+        self.prefs.remember_regions(
+            self.project.ppt_region,
+            self.project.camera_regions,
+        )
 
     def _refresh_camera_row_labels(self) -> None:
         if self.project is None:
@@ -556,6 +605,7 @@ class MainWindow(QMainWindow):
             del self.project.camera_regions[count:]
         self.project.history("set_camera_count", f"摄像头区域数量：{count}")
         self.project.touch()
+        self._remember_regions()
         self._rebuild_camera_rows()
         self._sync_camera_preview()
         self.review.refresh_current()
@@ -615,6 +665,7 @@ class MainWindow(QMainWindow):
         self.player.position_changed.connect(self._on_position_changed)
         self.player.duration_changed.connect(self._on_duration_changed)
         self.player.playing_changed.connect(self._on_playing_changed)
+        self.player.video_changed.connect(self._on_player_video_changed)
         self.player.error.connect(self._on_player_error)
         self.play_button.clicked.connect(self.player.toggle)
         self.back_button.clicked.connect(lambda: self.player.seek(max(0.0, self.player.position - 5.0)))
@@ -628,6 +679,7 @@ class MainWindow(QMainWindow):
         self.review.changed.connect(self._on_review_changed)
         self.review.locate_requested.connect(self._locate_video)
         self.review.status_message.connect(lambda message: self.statusBar().showMessage(message, 6000))
+        self.open_preview_button.clicked.connect(self.open_large_preview)
 
     # --------------------------------------------------------------- Project
     def _show_project(self, project: SlidesProject | None, open_video: bool = True) -> None:
@@ -635,9 +687,11 @@ class MainWindow(QMainWindow):
         self._loading_project = True
         try:
             if project is None:
+                self._close_preview_dialog()
                 self.player.close()
                 self.preview.clear_image()
                 self.preview.set_regions(None, [])
+                self.video_list.clear()
                 self.info_file.setText("未导入")
                 self.info_spec.setText("—")
                 self.video_name_label.setText("未导入视频")
@@ -652,16 +706,44 @@ class MainWindow(QMainWindow):
                 self.settings_summary.setText("")
                 self.review.set_project(None)
                 self._selecting_region = None
+                self._selection_canvas = None
                 self._reset_selection_buttons()
                 return
-            info = project.video_info
-            self.video_name_label.setText(Path(info.path).name if info.path else "（视频路径缺失）")
-            self.info_file.setText(Path(info.path).name if info.path else "（路径缺失）")
-            self.info_file.setToolTip(info.path)
+            sources = project.video_sources()
+            self._refresh_video_list()
+            first = sources[0] if sources else project.video_info
+            first_path = Path(first.path) if first and first.path else None
+            if len(sources) > 1:
+                label = f"{len(sources)} 个视频 · {first_path.name if first_path else '（路径缺失）'} 等"
+            else:
+                label = first_path.name if first_path else "（视频路径缺失）"
+            self.video_name_label.setText(label)
+            self.info_file.setText(label)
+            self.info_file.setToolTip(
+                "\n".join(info.path for info in sources) if sources else ""
+            )
+            resolutions = {
+                f"{info.width} × {info.height}"
+                for info in sources
+                if info.width and info.height
+            }
+            resolution = (
+                next(iter(resolutions))
+                if len(resolutions) == 1
+                else (f"{len(resolutions)} 种分辨率" if resolutions else "未知")
+            )
+            total_duration = project.total_duration_sec() or (
+                first.duration_sec if first else 0.0
+            )
+            total_size = sum(int(info.file_size or 0) for info in sources)
+            fps = first.fps if first else 0.0
+            codec = first.codec if first else ""
             spec = (
-                f"{format_timecode(info.duration_sec)} · {info.resolution}"
-                + (f" · {info.fps:.2f} fps" if info.fps else "")
-                + f" · {info.codec or '未知编码'} · {_format_size(info.file_size)}"
+                f"{format_timecode(total_duration)}"
+                + (f" · 共 {len(sources)} 段" if len(sources) > 1 else "")
+                + f" · {resolution}"
+                + (f" · {fps:.2f} fps" if fps else "")
+                + f" · {codec or '未知编码'} · {_format_size(total_size)}"
             )
             self.info_spec.setText(spec)
             if not ffmpeg_available():
@@ -686,10 +768,14 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_summary()
             self._update_range_display()
             if open_video:
-                path = Path(info.path) if info.path else None
-                if path and path.is_file():
+                missing = [
+                    info.path or f"视频 {index + 1}"
+                    for index, info in enumerate(sources)
+                    if not info.path or not Path(info.path).is_file()
+                ]
+                if sources and not missing:
                     try:
-                        self.player.open(str(path), info)
+                        self.player.open_playlist(sources)
                     except Exception as exc:
                         self.player.close()
                         self.preview.clear_image()
@@ -701,11 +787,16 @@ class MainWindow(QMainWindow):
                 else:
                     self.player.close()
                     self.preview.clear_image()
-                    QMessageBox.warning(
-                        self,
-                        "视频文件缺失",
-                        "项目引用的视频文件不存在。候选截图仍可查看和导出，但无法预览或重新分析。",
-                    )
+                    if sources:
+                        QMessageBox.warning(
+                            self,
+                            "视频文件缺失",
+                            "以下视频文件不存在，无法预览或重新分析：\n"
+                            + "\n".join(missing)
+                            + "\n\n候选截图仍可查看和导出。",
+                        )
+            if self.preview_dialog is not None:
+                self.preview_dialog.set_project(project, self._regions_editable())
         finally:
             self._loading_project = False
             self._update_title()
@@ -717,33 +808,111 @@ class MainWindow(QMainWindow):
         if not self._maybe_save_changes():
             return
         start_dir = self.prefs.last_video_dir or str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "导入网课视频",
+            "导入网课视频（可多选）",
             start_dir,
             "视频文件 (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv *.wmv *.ts *.mts *.m2ts);;所有文件 (*)",
         )
-        if not path:
+        if not paths:
             return
-        self.prefs.last_video_dir = str(Path(path).parent)
+        self.prefs.last_video_dir = str(Path(paths[0]).parent)
+        self._import_videos(paths)
+
+    def append_videos(self) -> None:
+        if self._busy_kind:
+            return
+        if self.project is None:
+            self.import_video()
+            return
+        start_dir = self.prefs.last_video_dir or str(Path.home())
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "追加网课视频（可多选）",
+            start_dir,
+            "视频文件 (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv *.wmv *.ts *.mts *.m2ts);;所有文件 (*)",
+        )
+        if not paths:
+            return
+        self.prefs.last_video_dir = str(Path(paths[0]).parent)
+        self._import_videos(paths, append=True)
+
+    def _import_videos(self, paths: list[str | Path], append: bool = False) -> None:
+        if self._busy_kind or not paths:
+            return
+        if not append and not self._maybe_save_changes():
+            return
+        infos: list[VideoInfo] = []
+        failures: list[str] = []
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            info = probe_video(path)
-        except (VideoError, Exception) as exc:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "无法导入视频", str(exc))
-            return
+            for path in paths:
+                try:
+                    infos.append(probe_video(path))
+                except (VideoError, Exception) as exc:
+                    failures.append(f"{Path(path).name}：{exc}")
         finally:
             if QApplication.overrideCursor() is not None:
                 QApplication.restoreOverrideCursor()
+        if failures:
+            QMessageBox.warning(
+                self,
+                "部分视频无法导入",
+                "以下视频无法读取，已跳过：\n" + "\n".join(failures),
+            )
+        if not infos:
+            return
+
+        if append and self.project is not None and self.project.video_sources():
+            project = self.project
+            added_duration = sum(float(info.duration_sec or 0.0) for info in infos)
+            sources = project.video_sources()
+            sources.extend(infos)
+            project.videos = sources
+            project.sync_primary_video()
+            project.content_end = min(
+                project.total_duration_sec(),
+                project.content_end + added_duration,
+            )
+            project.history(
+                "add_videos",
+                "追加视频：" + "、".join(Path(info.path).name for info in infos),
+            )
+            project.touch()
+            position = self.player.position if self.player.reader is not None else 0.0
+            self._show_project(project)
+            if position > 0:
+                self.player.seek(position)
+            self.autosave_timer.start()
+            if project.pages:
+                self.analysis_warning.setText(
+                    "已追加视频。重新分析后才会提取新视频中的页面；已有候选页面的时间轴保持不变。"
+                )
+            self.statusBar().showMessage(
+                f"已追加 {len(infos)} 个视频；总时长 {format_timecode(project.total_duration_sec())}。",
+                8000,
+            )
+            self.task_status.setText(
+                "视频已追加到连续时间轴末尾。设置正片区间后点击“开始分析”。"
+            )
+            self._update_title()
+            return
+
         settings = AnalysisSettings.from_dict(self.prefs.analysis_settings.to_dict())
+        ppt_region, camera_regions = self.prefs.region_preset()
+        name = (
+            Path(infos[0].path).stem
+            if len(infos) == 1
+            else f"{Path(infos[0].path).stem} 等 {len(infos)} 个视频"
+        )
         project = SlidesProject(
-            name=Path(path).stem,
-            video_info=info,
+            name=name,
+            video_info=infos[0],
+            videos=infos,
             content_start=0.0,
-            content_end=info.duration_sec,
-            ppt_region=Rect.full_frame(),
-            camera_regions=[],
+            content_end=sum(float(info.duration_sec or 0.0) for info in infos),
+            ppt_region=ppt_region,
+            camera_regions=camera_regions,
             settings=settings,
         )
         project.project_path = None
@@ -751,11 +920,20 @@ class MainWindow(QMainWindow):
         project.dirty = False
         self._show_project(project)
         self._reset_player_to_zero()
+        restored_note = ""
+        if (
+            ppt_region != Rect.full_frame()
+            or camera_regions
+        ):
+            restored_note = "已自动套用上次保存的 PPT / 摄像头区域。"
         self.statusBar().showMessage(
-            f"已导入 {Path(path).name}，请设置正片区间和 PPT 区域。", 8000
+            f"已导入 {len(infos)} 个视频（共 {format_timecode(project.total_duration_sec())}）。"
+            + restored_note,
+            9000,
         )
         self.task_status.setText(
-            "视频已就绪。区域可直接拖动边框/控制点调整；设置完成后点击“开始分析”。"
+            "视频已就绪。多段视频会按列表顺序作为一个连续视频分析；"
+            "设置完成后点击“开始分析”。"
         )
         if not ffmpeg_available():
             QMessageBox.warning(
@@ -769,6 +947,145 @@ class MainWindow(QMainWindow):
         if self.player.reader is not None:
             self.player.seek(0.0)
             self._update_range_display()
+
+    def _regions_editable(self) -> bool:
+        return (
+            self.project is not None
+            and self.player.reader is not None
+            and self._busy_kind is None
+        )
+
+    def _refresh_video_list(self) -> None:
+        self.video_list.blockSignals(True)
+        try:
+            self.video_list.clear()
+            if self.project is None:
+                return
+            for segment in self.project.timeline_segments():
+                info = segment.video_info
+                name = Path(info.path).name if info.path else "（路径缺失）"
+                resolution = info.resolution
+                item = QListWidgetItem(
+                    f"{segment.index + 1}. {name}\n"
+                    f"{format_timecode(segment.duration_sec)} · {resolution}"
+                )
+                item.setData(Qt.ItemDataRole.UserRole, segment.index)
+                item.setToolTip(
+                    f"{info.path}\n连续时间轴起点："
+                    f"{format_timecode(segment.start_sec, milliseconds=True)}"
+                )
+                self.video_list.addItem(item)
+            if self.player.video_index >= 0:
+                self.video_list.setCurrentRow(
+                    min(self.player.video_index, self.video_list.count() - 1)
+                )
+        finally:
+            self.video_list.blockSignals(False)
+
+    def _on_player_video_changed(self, index: int) -> None:
+        if self.video_list.count() and 0 <= index < self.video_list.count():
+            if self.video_list.currentRow() != index:
+                blocked = self.video_list.blockSignals(True)
+                self.video_list.setCurrentRow(index)
+                self.video_list.blockSignals(blocked)
+        if self.preview_dialog is not None:
+            self.preview_dialog.update_source_label()
+
+    def _seek_to_video_item(self, item: QListWidgetItem) -> None:
+        if self.project is None or self.player.reader is None or item is None:
+            return
+        index = int(item.data(Qt.ItemDataRole.UserRole) or 0)
+        segments = self.project.timeline_segments()
+        if index < 0 or index >= len(segments):
+            return
+        segment = segments[index]
+        self.player.pause()
+        self.player.seek(segment.start_sec)
+        self._update_range_display(segment.start_sec)
+        self.statusBar().showMessage(
+            f"已定位到视频 {index + 1}："
+            f"{Path(segment.video_info.path).name if segment.video_info.path else ''}",
+            5000,
+        )
+
+    def _timeline_change_confirmed(self, action: str) -> bool:
+        if self.project is None:
+            return False
+        if not self.project.pages and not self.project.trash:
+            return True
+        extra = "以及回收站中的页面" if self.project.trash else ""
+        answer = QMessageBox.question(
+            self,
+            action,
+            f"{action}会改变多段视频的连续时间轴，现有候选页面{extra}将被清空。\n\n是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _clear_analysis_after_timeline_change(self) -> None:
+        if self.project is None:
+            return
+        self.project.pages = []
+        self.project.trash = []
+        self.project.removed_pages = []
+        self.project.analysis_region = None
+        self.project.analysis_stats = {}
+        self.project.warnings = []
+
+    def _remove_selected_video(self) -> None:
+        if self._busy_kind or self.project is None:
+            return
+        sources = self.project.video_sources()
+        row = self.video_list.currentRow()
+        if row < 0 or row >= len(sources):
+            QMessageBox.information(self, "未选择视频", "请先在视频列表中选择要移除的视频。")
+            return
+        if len(sources) <= 1:
+            QMessageBox.information(self, "至少保留一个视频", "项目至少需要保留一个视频。")
+            return
+        if not self._timeline_change_confirmed("移除视频"):
+            return
+        removed = sources.pop(row)
+        self.project.videos = sources
+        self.project.sync_primary_video()
+        self._clear_analysis_after_timeline_change()
+        self.project.content_start = 0.0
+        self.project.content_end = self.project.total_duration_sec()
+        self.project.history("remove_video", f"移除视频：{Path(removed.path).name}")
+        self.project.touch()
+        self._show_project(self.project)
+        self.autosave_timer.start()
+        self.statusBar().showMessage(f"已移除视频：{Path(removed.path).name}", 6000)
+
+    def _move_selected_video(self, delta: int) -> None:
+        if self._busy_kind or self.project is None:
+            return
+        sources = self.project.video_sources()
+        row = self.video_list.currentRow()
+        target = row + delta
+        if row < 0 or row >= len(sources):
+            QMessageBox.information(self, "未选择视频", "请先在视频列表中选择要移动的视频。")
+            return
+        if target < 0 or target >= len(sources):
+            return
+        if not self._timeline_change_confirmed("调整视频顺序"):
+            return
+        sources[row], sources[target] = sources[target], sources[row]
+        self.project.videos = sources
+        self.project.sync_primary_video()
+        self._clear_analysis_after_timeline_change()
+        self.project.content_start = 0.0
+        self.project.content_end = self.project.total_duration_sec()
+        self.project.history(
+            "reorder_video",
+            f"视频 {row + 1} 移动到 {target + 1}",
+        )
+        self.project.touch()
+        self._show_project(self.project)
+        self.video_list.setCurrentRow(target)
+        self.autosave_timer.start()
+        self.statusBar().showMessage("视频顺序已调整；请确认正片区间后重新分析。", 6000)
 
     def open_project(self) -> None:
         if self._busy_kind:
@@ -922,7 +1239,7 @@ class MainWindow(QMainWindow):
         if position is None:
             position = self.player.position
         total = self.player.duration or (
-            self.project.video_info.duration_sec if self.project else 0.0
+            self.project.total_duration_sec() if self.project else 0.0
         )
         self.time_label.setText(
             f"{format_timecode(position, milliseconds=True)} / {format_timecode(total)}"
@@ -954,7 +1271,7 @@ class MainWindow(QMainWindow):
     def _apply_time_edits(self) -> bool:
         if self._loading_project or self.project is None:
             return True
-        duration = self.project.video_info.duration_sec or self.player.duration
+        duration = self.project.total_duration_sec() or self.player.duration
         try:
             start = parse_timecode(self.start_edit.text(), duration)
             end = parse_timecode(self.end_edit.text(), duration)
@@ -993,7 +1310,7 @@ class MainWindow(QMainWindow):
     def _set_time_from_player(self, which: str) -> None:
         if self.project is None or self.player.reader is None:
             return
-        position = min(max(0.0, self.player.position), self.project.video_info.duration_sec)
+        position = min(max(0.0, self.player.position), self.project.total_duration_sec())
         if which == "start":
             if position >= self.project.content_end:
                 QMessageBox.warning(self, "无效的开始时间", "开始时间必须早于结束时间。")
@@ -1008,7 +1325,80 @@ class MainWindow(QMainWindow):
         if self.project:
             self._sync_time_edits()
 
-    def _begin_region_selection(self, kind: str, camera_id: str | None = None) -> None:
+    def open_large_preview(self) -> None:
+        if self.project is None or self.player.reader is None:
+            self.statusBar().showMessage("请先导入视频，再打开放大预览。", 5000)
+            return
+        if self.preview is not None and self.preview.selection_mode is not None:
+            self.preview.cancel_selection()
+        if self.preview_dialog is not None:
+            self.preview_dialog.show()
+            self.preview_dialog.raise_()
+            self.preview_dialog.activateWindow()
+            return
+        dialog = LargePreviewDialog(self.player, self)
+        self.preview_dialog = dialog
+        dialog.set_project(self.project, self._regions_editable())
+        dialog.selection_requested.connect(
+            lambda kind: self._on_large_preview_selection_requested(dialog, kind)
+        )
+        dialog.reset_ppt_requested.connect(self._reset_ppt_region)
+        dialog.clear_region_requested.connect(self._on_large_preview_clear_requested)
+        dialog.canvas.region_committed.connect(self._on_region_committed)
+        dialog.canvas.region_edit_started.connect(self._on_region_edit_started)
+        dialog.canvas.selection_cancelled.connect(self._on_selection_cancelled)
+        dialog.closed.connect(lambda d=dialog: self._on_preview_dialog_closed(d))
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self.statusBar().showMessage(
+            "放大预览已打开：可在其中拖拽框选 PPT 或摄像头区域；F11 全屏。",
+            6000,
+        )
+
+    def _on_large_preview_selection_requested(
+        self,
+        dialog: LargePreviewDialog,
+        target: str,
+    ) -> None:
+        if target == "ppt":
+            self._begin_region_selection("ppt", canvas=dialog.canvas)
+        elif target.startswith("camera:"):
+            camera_id = target.split(":", 1)[1]
+            self._begin_region_selection(
+                "camera",
+                camera_id,
+                canvas=dialog.canvas,
+            )
+
+    def _on_large_preview_clear_requested(self, target: str) -> None:
+        if target.startswith("camera:"):
+            self._clear_camera_region(target.split(":", 1)[1])
+
+    def _on_preview_dialog_closed(self, dialog: LargePreviewDialog) -> None:
+        if self.preview_dialog is dialog:
+            self.preview_dialog = None
+        if self._selection_canvas is dialog.canvas:
+            self._selecting_region = None
+            self._selection_canvas = None
+            self._reset_selection_buttons()
+
+    def _close_preview_dialog(self) -> None:
+        dialog = self.preview_dialog
+        if dialog is None:
+            return
+        self.preview_dialog = None
+        if self._selection_canvas is dialog.canvas:
+            self._selecting_region = None
+            self._selection_canvas = None
+        dialog.close()
+
+    def _begin_region_selection(
+        self,
+        kind: str,
+        camera_id: str | None = None,
+        canvas=None,
+    ) -> None:
         if self.project is None or self.player.reader is None or self._busy_kind:
             return
         if kind == "ppt":
@@ -1022,15 +1412,32 @@ class MainWindow(QMainWindow):
             label = f"摄像头 {index + 1}"
         else:
             return
-        if self.preview.selection_mode is not None:
+        target_canvas = canvas if canvas is not None else self.preview
+        if target_canvas.selection_mode is not None:
             same = self._selecting_region == target
-            self.preview.cancel_selection()
+            target_canvas.cancel_selection()
             if same:
                 return
+        active_canvas = self._selection_canvas
+        if (
+            active_canvas is not None
+            and active_canvas is not target_canvas
+            and active_canvas.selection_mode is not None
+        ):
+            active_canvas.cancel_selection()
         self.player.pause()
         self._selecting_region = target
-        self.preview.start_selection(target, label=label)
-        self.selection_hint_label.setText("拖拽框选，Esc 取消")
+        self._selection_canvas = target_canvas
+        if (
+            self.preview_dialog is not None
+            and target_canvas is self.preview_dialog.canvas
+        ):
+            self.preview_dialog.set_selection_started(target, label)
+            hint = "在放大的预览窗口中拖拽框选，Esc 取消"
+        else:
+            target_canvas.start_selection(target, label=label)
+            hint = "拖拽框选，Esc 取消"
+        self.selection_hint_label.setText(hint)
         self.ppt_select_button.setText(
             "拖拽中选择…" if target == "ppt" else "框选 PPT 区域"
         )
@@ -1042,10 +1449,13 @@ class MainWindow(QMainWindow):
     def _reset_selection_buttons(self) -> None:
         self.ppt_select_button.setText("框选 PPT 区域")
         self.selection_hint_label.setText("")
+        if self.preview_dialog is not None:
+            self.preview_dialog.set_selection_idle()
         self._refresh_camera_row_labels()
 
     def _on_region_committed(self, kind: str, region) -> None:
         self._selecting_region = None
+        self._selection_canvas = None
         self._reset_selection_buttons()
         if self.project is None:
             return
@@ -1077,6 +1487,7 @@ class MainWindow(QMainWindow):
         else:
             return
         self.project.touch()
+        self._remember_regions()
         self._sync_camera_preview()
         self.ppt_region_label.setText(_format_region_label(self.project.ppt_region))
         self._refresh_camera_row_labels()
@@ -1094,6 +1505,7 @@ class MainWindow(QMainWindow):
 
     def _on_selection_cancelled(self) -> None:
         self._selecting_region = None
+        self._selection_canvas = None
         self._reset_selection_buttons()
         self.statusBar().showMessage("已取消区域框选。", 3000)
 
@@ -1103,6 +1515,7 @@ class MainWindow(QMainWindow):
         self.project.ppt_region = Rect.full_frame()
         self.project.history("set_ppt_region", "重置为全画面")
         self.project.touch()
+        self._remember_regions()
         if self.project.pages:
             self.analysis_warning.setText(
                 "PPT 区域已重置。已有候选截图仍按旧区域生成，请重新分析以应用新区域。"
@@ -1124,10 +1537,14 @@ class MainWindow(QMainWindow):
         if camera.region is None:
             return
         if self._selecting_region == f"camera:{camera.id}":
-            self.preview.cancel_selection()
+            if self._selection_canvas is not None:
+                self._selection_canvas.cancel_selection()
+            else:
+                self.preview.cancel_selection()
         camera.region = None
         self.project.history("clear_camera_region", f"清除摄像头 {index + 1} 区域")
         self.project.touch()
+        self._remember_regions()
         self._sync_camera_preview()
         self._refresh_camera_row_labels()
         if self.project.pages:
@@ -1159,6 +1576,7 @@ class MainWindow(QMainWindow):
             f"摄像头 {index + 1}: {mode.label}",
         )
         self.project.touch()
+        self._remember_regions()
         if self.project.pages:
             self.analysis_warning.setText(
                 f"摄像头 {index + 1} 的处理方式已更改：该设置用于导出，已立即生效。"
@@ -1240,8 +1658,18 @@ class MainWindow(QMainWindow):
         if self.project is None:
             QMessageBox.information(self, "尚未导入视频", "请先导入一段网课视频。")
             return
-        if not self.project.video_info.path or not Path(self.project.video_info.path).is_file():
-            QMessageBox.critical(self, "视频文件不可用", "项目引用的视频文件不存在，无法分析。")
+        sources = self.project.video_sources()
+        missing = [
+            info.path or f"视频 {index + 1}"
+            for index, info in enumerate(sources)
+            if not info.path or not Path(info.path).is_file()
+        ]
+        if not sources or missing:
+            QMessageBox.critical(
+                self,
+                "视频文件不可用",
+                "以下视频文件不存在，无法分析：\n" + "\n".join(missing or ["（无视频源）"]),
+            )
             return
         if not self._apply_time_edits():
             return
@@ -1282,9 +1710,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "无法创建分析缓存", str(exc))
             return
         self.player.pause()
+        first_source = sources[0]
         self.analysis_worker = AnalysisWorker(
-            self.project.video_info.path,
-            self.project.video_info,
+            first_source.path,
+            first_source,
             self.project.content_start,
             self.project.content_end,
             self.project.ppt_region,
@@ -1293,6 +1722,7 @@ class MainWindow(QMainWindow):
             self.project.assets_root,
             run_dir,
             self,
+            video_sources=sources,
         )
         worker = self.analysis_worker
         worker.progress.connect(self._on_analysis_progress)
@@ -1501,9 +1931,12 @@ class MainWindow(QMainWindow):
         self.player.pause()
         self.player.seek(seconds)
         self._update_range_display(seconds)
-        self.statusBar().showMessage(
-            f"已定位到 {format_timecode(seconds, milliseconds=True)}", 4000
-        )
+        message = f"已定位到 {format_timecode(seconds, milliseconds=True)}"
+        if self.project is not None:
+            segment, _local = self.project.locate_time(seconds)
+            if segment is not None and len(self.project.video_sources()) > 1:
+                message += f"（视频 {segment.index + 1}）"
+        self.statusBar().showMessage(message, 4000)
 
     def _update_ui_state(self) -> None:
         busy = self._busy_kind is not None
@@ -1518,6 +1951,16 @@ class MainWindow(QMainWindow):
         self.analyze_action.setEnabled(has_project and has_video and not busy)
         self.analyze_button.setEnabled(has_project and has_video and not busy)
         self.settings_button.setEnabled(has_project and not busy)
+        self.open_preview_button.setEnabled(has_project and has_video and not busy)
+        self.add_video_button.setEnabled(has_project and not busy)
+        video_count = len(self.project.video_sources()) if self.project else 0
+        self.video_list.setEnabled(has_project and not busy)
+        for button in (
+            self.remove_video_button,
+            self.up_video_button,
+            self.down_video_button,
+        ):
+            button.setEnabled(has_project and video_count > 1 and not busy)
         for widget in (
             self.start_edit,
             self.end_edit,
@@ -1541,6 +1984,8 @@ class MainWindow(QMainWindow):
         self.save_action.setEnabled(has_project and not busy)
         self.review.set_edit_enabled((has_pages or has_trash) and not busy)
         self.preview.set_regions_editable(has_project and has_video and not busy)
+        if self.preview_dialog is not None:
+            self.preview_dialog.set_editable(has_project and has_video and not busy)
         if self._busy_kind == "analysis":
             self.analyze_button.setText("分析中…")
         elif self._busy_kind == "export":
@@ -1553,14 +1998,20 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "使用说明",
-            "1. 导入视频，预览并设置正片开始/结束时间。\n"
-            "2. 框选 PPT 区域；如老师摄像头在 PPT 上，可在“画面区域”中设置摄像头数量，"
+            "1. 导入视频（可一次多选），多段视频会按列表顺序拼成一个连续时间轴；"
+            "“添加视频…”可继续追加，“上移/下移/移除”可调整。\n"
+            "2. 预览并设置正片开始/结束时间；时间轴按所有视频的总时长计算。\n"
+            "3. 框选 PPT 区域；如老师摄像头在 PPT 上，可在“画面区域”中设置摄像头数量，"
             "再逐个框选并为每个区域选择忽略、裁剪、黑色遮罩或白色遮罩。\n"
-            "   已有区域可直接拖动边框或四角/边中点控制点微调，无需重新框选。\n"
-            "3. 点击“开始分析”。系统先低采样率粗扫，再在疑似切页处提高采样率寻找稳定帧。\n"
-            "4. 在下方复核：删除、上移/下移、跳过、切换备选帧、打开大图、定位原视频时间。\n"
-            "5. 点击“导出”（或 Ctrl+E）生成 PNG、PPTX 和 JSON 清单。\n"
-            "6. 项目会随人工修改自动保存到 .lsp.json 文件及同名 _assets 文件夹。\n\n"
+            "   已有区域可直接拖动边框或四角/边中点控制点微调。\n"
+            "   上次保存的 PPT / 摄像头区域会自动套用到新导入的视频。\n"
+            "4. 点“放大预览…”可打开更大的预览窗口，并在其中直接框选 PPT 或摄像头区域；"
+            "窗口内按 F11 可全屏。\n"
+            "5. 点击“开始分析”。系统对每段视频先低采样率粗扫，再在疑似切页处提高采样率寻找稳定帧，"
+            "最后合并为一个候选页面列表。\n"
+            "6. 在下方复核：删除、上移/下移、跳过、切换备选帧、打开大图、定位原视频时间。\n"
+            "7. 点击“导出”（或 Ctrl+E）生成一份 PNG、PPTX 和 JSON 清单。\n"
+            "8. 项目会随人工修改自动保存到 .lsp.json 文件及同名 _assets 文件夹。\n\n"
             "说明：分析时始终排除所有已设置摄像头区域；各区域的导出处理方式可以不同。"
             "笔迹和小范围动画通常不会被视为新页面。",
         )
@@ -1586,17 +2037,25 @@ class MainWindow(QMainWindow):
         event.ignore()
 
     def dropEvent(self, event) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if not path.is_file():
-                continue
-            if path.suffix.lower() == ".json":
-                self.open_project_path(path)
-            else:
-                self.import_video_path(path)
+        files = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if url.toLocalFile()
+        ]
+        files = [path for path in files if path.is_file()]
+        if not files:
+            event.ignore()
+            return
+        project_file = next(
+            (path for path in files if path.suffix.lower() == ".json"),
+            None,
+        )
+        if project_file is not None:
+            self.open_project_path(project_file)
             event.acceptProposedAction()
             return
-        event.ignore()
+        self._import_videos(files)
+        event.acceptProposedAction()
 
     def open_project_path(self, path: str | Path) -> None:
         if self._busy_kind:
@@ -1623,34 +2082,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已打开项目：{Path(path).name}", 7000)
 
     def import_video_path(self, path: str | Path) -> None:
-        if self._busy_kind:
-            return
-        if not self._maybe_save_changes():
-            return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            info = probe_video(path)
-        except Exception as exc:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "无法导入视频", str(exc))
-            return
-        finally:
-            if QApplication.overrideCursor() is not None:
-                QApplication.restoreOverrideCursor()
-        project = SlidesProject(
-            name=Path(path).stem,
-            video_info=info,
-            content_start=0.0,
-            content_end=info.duration_sec,
-            ppt_region=Rect.full_frame(),
-            camera_regions=[],
-            settings=AnalysisSettings.from_dict(self.prefs.analysis_settings.to_dict()),
-        )
-        self._show_project(project)
-        self.task_status.setText(
-            "视频已就绪。区域可直接拖动边框/控制点调整；设置完成后点击“开始分析”。"
-        )
-        self.statusBar().showMessage(f"已导入 {Path(path).name}", 7000)
+        self.import_video_paths([path])
+
+    def import_video_paths(self, paths: list[str | Path]) -> None:
+        self._import_videos(list(paths))
 
     # ---------------------------------------------------------------- Closing
     def closeEvent(self, event) -> None:
@@ -1661,6 +2096,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.prefs.save()
+        self._close_preview_dialog()
         self.player.close()
         self.autosave_timer.stop()
         super().closeEvent(event)

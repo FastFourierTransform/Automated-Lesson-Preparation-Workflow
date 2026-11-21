@@ -40,10 +40,12 @@ class AnalysisWorker(QThread):
         assets_root: str | Path,
         run_dir: str | Path,
         parent=None,
+        video_sources: list[VideoInfo] | None = None,
     ):
         super().__init__(parent)
         self.video_path = video_path
         self.video_info = video_info
+        self.video_sources = copy.deepcopy(video_sources or [])
         self.content_start = content_start
         self.content_end = content_end
         self.ppt_region = ppt_region
@@ -71,6 +73,7 @@ class AnalysisWorker(QThread):
                 cancel_event=self._cancel_event,
                 progress_cb=lambda value, message: self.progress.emit(value, message),
                 status_cb=lambda message: self.status.emit(message),
+                video_sources=self.video_sources or None,
             )
             result = engine.analyze()
             self.completed.emit(result)

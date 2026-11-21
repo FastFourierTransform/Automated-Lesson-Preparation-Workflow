@@ -131,6 +131,7 @@ STAGES = tuple(
 | `core/media/probe.py` | FFprobe + OpenCV 元数据探测与校验 |
 | `core/media/reader.py` | 帧精确读取、顺序窗口采样、资源释放 |
 | `core/media/sampler.py` | FFmpeg 管道流式采样 |
+| `core/media/timeline.py` | 多视频连续时间轴、全局/局部时间映射 |
 | `core/media/utils.py` | Unicode 路径图片读写、缩略图 |
 | `core/project/paths.py` | 项目文件名、`_assets` 目录、资源相对路径解析 |
 | `core/ui/player.py` | OpenCV 预览播放器 |
@@ -174,7 +175,7 @@ lesson_assets/
 
 `core/ui` 只放与业务无关的控件：
 
-- `VideoPlayer`：只负责播放和定位，不关心“页面候选”。
+- `VideoPlayer`：负责单/多视频连续播放与全局定位，不关心“页面候选”。
 - `PreviewCanvas`：显示画面并输出归一化 `Rect`，不关心区域是 PPT 还是摄像头。
 - `ImagePreviewDialog`：显示任意图片。
 - `theme` / `icons`：视觉样式。

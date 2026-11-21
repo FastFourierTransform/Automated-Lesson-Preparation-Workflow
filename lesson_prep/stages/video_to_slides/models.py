@@ -6,10 +6,17 @@ import uuid
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable
 
 from ...core.geometry import Rect
 from ...core.media.models import VideoInfo
+from ...core.media.timeline import (
+    VideoSegment,
+    build_timeline,
+    segment_for_time,
+    timeline_duration,
+)
 
 
 class CameraMode(str, Enum):
@@ -91,10 +98,13 @@ class AlternativeFrame:
     stability: float = 0.0
     sharpness: float = 0.0
     flags: list[str] = field(default_factory=list)
+    # Zero-based source-video index on the combined timeline.
+    video_index: int = 0
 
     def to_dict(self) -> dict:
         return {
             "time_sec": round(float(self.time_sec), 3),
+            "video_index": int(self.video_index),
             "raw_path": self.raw_path,
             "thumb_path": self.thumb_path,
             "quality": round(float(self.quality), 4),
@@ -113,6 +123,7 @@ class AlternativeFrame:
             stability=float(data.get("stability") or 0.0),
             sharpness=float(data.get("sharpness") or 0.0),
             flags=list(data.get("flags") or []),
+            video_index=int(data.get("video_index") or 0),
         )
 
 
@@ -133,6 +144,8 @@ class PageCandidate:
     review_note: str = ""
     alternatives: list[AlternativeFrame] = field(default_factory=list)
     metrics: dict[str, float] = field(default_factory=dict)
+    # Zero-based source-video index on the combined timeline.
+    video_index: int = 0
 
     def selected_alternative(self) -> AlternativeFrame | None:
         if not self.alternatives:
@@ -174,6 +187,7 @@ class PageCandidate:
             "review_note": self.review_note,
             "alternatives": [a.to_dict() for a in self.alternatives],
             "metrics": {k: round(float(v), 5) for k, v in self.metrics.items()},
+            "video_index": int(self.video_index),
         }
 
     @classmethod
@@ -194,6 +208,7 @@ class PageCandidate:
             review_note=str(data.get("review_note") or ""),
             alternatives=[AlternativeFrame.from_dict(a) for a in (data.get("alternatives") or [])],
             metrics={k: float(v) for k, v in (data.get("metrics") or {}).items()},
+            video_index=int(data.get("video_index") or 0),
         )
         if page.alternatives and not page.selected_raw_path:
             alt = page.selected_alternative()
@@ -394,7 +409,10 @@ class AnalysisSettings:
 class SlidesProject:
     """Project state for one video-to-slides extraction session."""
     name: str = "未命名项目"
+    # ``video_info`` remains the first source video for compatibility with
+    # older project files and callers.  ``videos`` holds the full ordered list.
     video_info: VideoInfo = field(default_factory=VideoInfo)
+    videos: list[VideoInfo] = field(default_factory=list)
     content_start: float = 0.0
     content_end: float = 0.0
     ppt_region: Rect = field(default_factory=Rect.full_frame)
@@ -423,6 +441,42 @@ class SlidesProject:
 
     def configured_camera_regions(self) -> list[CameraRegion]:
         return [camera for camera in self.camera_regions if camera.is_configured()]
+
+    def video_sources(self) -> list[VideoInfo]:
+        """Ordered source videos, with legacy single-video fallback."""
+        if self.videos:
+            return list(self.videos)
+        if self.video_info.path or self.video_info.duration_sec > 0:
+            return [self.video_info]
+        return []
+
+    def timeline_segments(self) -> list[VideoSegment]:
+        return build_timeline(self.video_sources())
+
+    def total_duration_sec(self) -> float:
+        return timeline_duration(self.timeline_segments())
+
+    def locate_time(self, time_sec: float) -> tuple[VideoSegment | None, float]:
+        """Map a combined-timeline time to ``(source segment, local time)``."""
+        return segment_for_time(self.timeline_segments(), time_sec)
+
+    def source_video_index(self, time_sec: float) -> int:
+        segment, _local = self.locate_time(time_sec)
+        return segment.index if segment is not None else 0
+
+    def source_video_label(self, index: int) -> str:
+        sources = self.video_sources()
+        if not sources:
+            return ""
+        index = max(0, min(int(index), len(sources) - 1))
+        name = Path(sources[index].path).name if sources[index].path else "（路径缺失）"
+        return f"视频 {index + 1}/{len(sources)} · {name}"
+
+    def sync_primary_video(self) -> None:
+        """Keep the legacy ``video_info`` field aligned with the first source."""
+        sources = self.video_sources()
+        if sources:
+            self.video_info = sources[0]
 
     def move_page_to_trash(self, page_id: str, reason: str = "用户删除") -> TrashEntry | None:
         """Remove a page from the review list and retain all of its data."""

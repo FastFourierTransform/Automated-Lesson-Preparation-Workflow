@@ -5,4 +5,4 @@ The application is organised as a shared ``core`` plus independent workflow
 Planned: ``video_to_handout`` and ``ppt_to_handout``.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
